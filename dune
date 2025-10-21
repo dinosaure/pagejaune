@@ -8,6 +8,8 @@
   ca-certs-nss
   dns-server
   dns-resolver
+  dns-resolver.shared
+  mirage-ptime.solo5
   mkernel
   mnet
   mnet.tls
