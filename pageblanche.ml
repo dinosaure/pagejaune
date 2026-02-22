@@ -1,29 +1,34 @@
 module RNG = Mirage_crypto_rng.Fortuna
-module Resolver = Resolver
 
 let _2s = 2_000_000_000
 let ( let@ ) finally fn = Fun.protect ~finally fn
 let rec forever () = Mkernel.sleep _2s; forever ()
+let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
+let rng = Mkernel.map rng Mkernel.[]
+let ( let* ) = Result.bind
 
-let run _ cidr gateway features =
-  let devices =
-    let open Mkernel in
-    [ Mnet.stackv4 ~name:"service" ?gateway cidr ]
-  in
-  Mkernel.run devices @@ fun (daemon, tcpv4, udpv4) () ->
-  let rng = Mirage_crypto_rng_mkernel.initialize (module RNG) in
+let run _ (cidr, gateway, ipv6) features authenticator =
+  Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidr ])
+  @@ fun rng (daemon, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill daemon in
+  let hed, he = Mnet_happy_eyeballs.create ~happy_eyeballs tcp in
+  let@ () = fun () -> Mnet_happy_eyeballs.kill hed in
+  let t, daemon = Mnet_dns.create ~nameservers ~timeout (udp, he) in
   let rng = Mirage_crypto_rng.generate in
-  let root = Dns_resolver_shared.Root.reserved in
-  let primary = Dns_server.Primary.create ~rng root in
-  let authenticator = Ca_certs_nss.authenticator () in
-  let authenticator = Result.get_ok authenticator in
-  let tls = Tls.Config.client ~authenticator () in
-  let tls = Result.get_ok tls in
-  let _resolver, daemon = Resolver.create ~features tls tcpv4 udpv4 primary in
-  let@ () = fun () -> Resolver.kill daemon in
-  forever ()
+  let primary = Dns_server.Primary.create ~rng Dns_trie.empty in
+  let primary =
+    if with_reserved then
+      let trie = Dns_server.Primary.data primary in
+      let trie = Dns_trie.insert_map Dns_resolver_root.reserved_zones trie in
+      let primary, _ =
+        Dns_server.Primary.with_data primary (wall ()) (now ()) trie
+      in
+      primary
+    else primary
+  in
+  let server = Dns_server.Primary.server primary in
+  assert false
 
 open Cmdliner
 
@@ -85,11 +90,8 @@ let setup_sources = function
   | [ (_, `None) ] -> None
   | res ->
       let res = List.map snd res in
-      let res =
-        List.fold_left
-          (fun acc -> function `Re re -> re :: acc | _ -> acc)
-          [] res
-      in
+      let fn acc = function `Re re -> re :: acc | _ -> acc in
+      let res = List.fold_left fn [] res in
       Some (Re.alt res)
 
 let setup_sources = Term.(const setup_sources $ sources)
@@ -102,44 +104,12 @@ let setup_logs utf_8 style_renderer sources level =
   Option.is_none level
 
 let setup_logs =
-  Term.(const setup_logs $ utf_8 $ renderer $ setup_sources $ verbosity)
-
-let ipv4 =
-  let doc = "The IP address of the unikernel." in
-  let ipaddr = Arg.conv (Ipaddr.V4.Prefix.of_string, Ipaddr.V4.Prefix.pp) in
-  let open Arg in
-  required & opt (some ipaddr) None & info [ "ipv4" ] ~doc ~docv:"IPv4"
-
-let ipv4_gateway =
-  let doc = "The IP gateway." in
-  let ipaddr = Arg.conv (Ipaddr.V4.of_string, Ipaddr.V4.pp) in
-  let open Arg in
-  value & opt (some ipaddr) None & info [ "ipv4-gateway" ] ~doc ~docv:"IPv4"
-
-let features =
-  let open Arg in
-  let dnssec = info [ "dnssec" ] ~doc:"DNSSec validation" in
-  let opportunistic_tls_authoritative =
-    let doc = "Opportunistic encryption using TLS to the authoritative" in
-    info [ "opportunistic-tls-authoritative" ] ~doc
-  in
-  let qname_minimisation =
-    let doc = "Query name minimisation" in
-    info [ "qname-minimisation" ] ~doc
-  in
-  let flags =
-    [
-      (`Dnssec, dnssec)
-    ; (`Opportunistic_tls_authoritative, opportunistic_tls_authoritative)
-    ; (`Qname_minimisation, qname_minimisation)
-    ]
-  in
-  let defaults = [] in
-  value & vflag_all defaults flags
+  let open Term in
+  const setup_logs $ utf_8 $ renderer $ setup_sources $ verbosity
 
 let term =
   let open Term in
-  const run $ setup_logs $ ipv4 $ ipv4_gateway $ features
+  const run $ setup_logs $ Mnet_cli.setup
 
 let cmd =
   let info = Cmd.info "pagejaune" in

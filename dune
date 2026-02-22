@@ -1,6 +1,7 @@
 (executable
- (name main)
- (modules main resolver)
+ (name pagejaune)
+ (public_name pagejaune)
+ (modules pagejaune resolver)
  (link_flags :standard -cclib "-z solo5-abi=hvt")
  (libraries
   hxd.core
@@ -12,7 +13,8 @@
   mirage-ptime.solo5
   mkernel
   mnet
-  mnet.tls
+  mnet-tls
+  mnet-cli
   mirage-crypto-rng-mkernel
   cmdliner
   logs.cli
@@ -46,6 +48,6 @@
  (action
   (with-stdout-to
    manifest.json
-   (run %{exe:main.exe} --ipv4=0.0.0.0/24))))
+   (run %{exe:pagejaune.exe} --ipv4=0.0.0.0/24))))
 
 (vendored_dirs vendors)
