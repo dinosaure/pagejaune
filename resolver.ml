@@ -430,13 +430,13 @@ let handle_query0 t ((protocol, _dst, _data) as elt) =
 
 (*/*)
 
-let handle_answer_on_udp t (_protocol, dst, port, _ttl, data) =
+let handle_answer_on_udp t (`Udp, dst, port, _ttl, data) =
   match Mnet.UDP.sendto t.udp ~dst ~src_port:53 ~port data with
   | Ok () -> ()
   | Error _ ->
       Log.err (fun m -> m "Impossible to answer to %a:%d" Ipaddr.pp dst port)
 
-let handle_answer_on_conn t (_protocol, dst, port, _ttl, data) =
+let handle_answer_on_conn t (`Tcp, dst, port, _ttl, data) =
   Log.debug (fun m ->
       m "search an active connection with %a:%d" Ipaddr.pp dst port);
   let from_connection = Hashtbl.find_opt t.ins (dst, port) in
@@ -460,10 +460,12 @@ let handle_answer_on_conn t (_protocol, dst, port, _ttl, data) =
             port)
   | Some _, Some _ -> assert false
 
-let handle_answer t (protocol, dst, port, ttl, data, _, _, _, _) =
-  match protocol with
-  | `Udp -> handle_answer_on_udp t (protocol, dst, port, ttl, data)
-  | `Tcp -> handle_answer_on_conn t (protocol, dst, port, ttl, data)
+let handle_answer t = function
+  | `Answer (`Udp, dst, port, ttl, data, _, _, _, _) ->
+      handle_answer_on_udp t (`Udp, dst, port, ttl, data)
+  | `Answer (`Tcp, dst, port, ttl, data, _, _, _, _) ->
+      handle_answer_on_conn t (`Tcp, dst, port, ttl, data)
+  | `Don't_answer _ -> ()
 
 (*/*)
 

@@ -1,7 +1,5 @@
-let install =
-  {text|bin: [
+let install = {text|bin: [
   "pagejaune.hvt"
-  "pagejaune.exe" {"pagejaune"}
 ]
 |text}
 

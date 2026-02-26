@@ -14,3 +14,4 @@
 [ ! -d "vendors/utcp" ] && opam source utcp --dir vendors/utcp
 [ ! -d "vendors/ca-certs-nss" ] && opam source ca-certs-nss --dir vendors/ca-certs-nss
 [ ! -d "vendors/mirage-ptime" ] && opam source mirage-ptime --dir vendors/mirage-ptime
+[ ! -d "vendors/zarith" ] && opam source zarith --dir vendors/zarith
