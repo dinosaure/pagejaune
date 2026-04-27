@@ -5,30 +5,19 @@ let ( let@ ) finally fn = Fun.protect ~finally fn
 let rec forever () = Mkernel.sleep _2s; forever ()
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
-let ( let* ) = Result.bind
 
-let run _ (cidr, gateway, ipv6) features authenticator =
+module Stub = Stub
+
+let run _ (cidr, gateway, ipv6) nameservers happy_eyeballs =
   Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidr ])
   @@ fun rng (daemon, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
   let@ () = fun () -> Mnet.kill daemon in
   let hed, he = Mnet_happy_eyeballs.create ~happy_eyeballs tcp in
   let@ () = fun () -> Mnet_happy_eyeballs.kill hed in
-  let t, daemon = Mnet_dns.create ~nameservers ~timeout (udp, he) in
-  let rng = Mirage_crypto_rng.generate in
-  let primary = Dns_server.Primary.create ~rng Dns_trie.empty in
-  let primary =
-    if with_reserved then
-      let trie = Dns_server.Primary.data primary in
-      let trie = Dns_trie.insert_map Dns_resolver_root.reserved_zones trie in
-      let primary, _ =
-        Dns_server.Primary.with_data primary (wall ()) (now ()) trie
-      in
-      primary
-    else primary
-  in
-  let server = Dns_server.Primary.server primary in
-  assert false
+  let cfg = Stub.config ~nameservers 53 in
+  let _stub, _daemon = Stub.create cfg tcp udp (udp, he) in
+  forever ()
 
 open Cmdliner
 
@@ -107,9 +96,30 @@ let setup_logs =
   let open Term in
   const setup_logs $ utf_8 $ renderer $ setup_sources $ verbosity
 
+let setup_happy_eyeballs
+    {
+      Mnet_cli.aaaa_timeout
+    ; connect_delay
+    ; connect_timeout
+    ; resolve_timeout
+    ; resolve_retries
+    } =
+  let now = Mkernel.clock_monotonic () in
+  let now = Int64.of_int now in
+  Happy_eyeballs.create ~aaaa_timeout ~connect_delay ~connect_timeout
+    ~resolve_timeout ~resolve_retries now
+
+let setup_happy_eyeballs =
+  let open Term in
+  const setup_happy_eyeballs $ Mnet_cli.setup_happy_eyeballs
+
 let term =
   let open Term in
-  const run $ setup_logs $ Mnet_cli.setup
+  const run
+  $ setup_logs
+  $ Mnet_cli.setup
+  $ Mnet_cli.setup_nameservers ()
+  $ setup_happy_eyeballs
 
 let cmd =
   let info = Cmd.info "pagejaune" in

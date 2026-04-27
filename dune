@@ -24,30 +24,85 @@
   gmp)
  (foreign_stubs
   (language c)
-  (names manifest)))
+  (names manifest.pagejaune)))
 
 (rule
- (targets manifest.c)
+ (targets manifest.pagejaune.c)
  (enabled_if
   (= %{context_name} "default"))
  (action
-  (write-file manifest.c "")))
+  (write-file manifest.pagejaune.c "")))
 
 (rule
- (targets manifest.c)
- (deps manifest.json)
+ (targets manifest.pagejaune.c)
+ (deps manifest.pagejaune.json)
  (enabled_if
   (= %{context_name} "solo5"))
  (action
-  (run solo5-elftool gen-manifest manifest.json manifest.c)))
+  (run
+   solo5-elftool
+   gen-manifest
+   manifest.pagejaune.json
+   manifest.pagejaune.c)))
 
 (rule
- (targets manifest.json)
+ (targets manifest.pagejaune.json)
  (enabled_if
   (= %{context_name} "solo5"))
  (action
   (with-stdout-to
-   manifest.json
+   manifest.pagejaune.json
    (run %{exe:pagejaune.exe} --ipv4=0.0.0.0/24))))
+
+(executable
+ (name pageblanche)
+ (public_name pageblanche)
+ (modules pageblanche stub)
+ (link_flags :standard -cclib "-z solo5-abi=hvt")
+ (libraries
+  mnet
+  mnet-cli
+  mnet-dns
+  dns-server
+  dns-resolver.shared
+  dns-tsig
+  logs.cli
+  fmt.cli
+  logs.fmt
+  re
+  gmp
+  mirage-crypto-rng-mkernel
+  mnet-happy-eyeballs)
+ (foreign_stubs
+  (language c)
+  (names manifest.pageblanche)))
+
+(rule
+ (targets manifest.pageblanche.c)
+ (enabled_if
+  (= %{context_name} "default"))
+ (action
+  (write-file manifest.pageblanche.c "")))
+
+(rule
+ (targets manifest.pageblanche.c)
+ (deps manifest.pageblanche.json)
+ (enabled_if
+  (= %{context_name} "solo5"))
+ (action
+  (run
+   solo5-elftool
+   gen-manifest
+   manifest.pageblanche.json
+   manifest.pageblanche.c)))
+
+(rule
+ (targets manifest.pageblanche.json)
+ (enabled_if
+  (= %{context_name} "solo5"))
+ (action
+  (with-stdout-to
+   manifest.pageblanche.json
+   (run %{exe:pageblanche.exe} --ipv4=0.0.0.0/24))))
 
 (vendored_dirs vendors)
