@@ -1,11 +1,10 @@
 # `pagejaune`
 
-**Pagejaune** is a recursive DNS resolver implemented as a unikernel. It
+**pagejaune** is a recursive DNS resolver implemented as a unikernel. It
 resolves DNS queries by talking directly to root servers, without relying on
-any third-party resolver (such as `8.8.8.8` or `1.1.1.1`).
-
-The project is written in OCaml 5 and runs as a [Solo5][solo5] unikernel using
-the `hvt` backend.
+any third-party resolver (such as `8.8.8.8` or `1.1.1.1`). The project is
+written in OCaml 5 and runs as a [Solo5][solo5] unikernel using the `hvt`
+backend.
 
 ## Features
 
@@ -69,20 +68,20 @@ dig robur.coop @10.0.0.2
 
 ### Options
 
-| Option | Description |
-|--------|-------------|
-| `--ipv4=CIDR` | IPv4 address and netmask (e.g. `10.0.0.2/24`) |
-| `--ipv4-gateway=ADDR` | IPv4 gateway |
-| `--ipv6` | Enable IPv6 support |
-| `--dnssec` | Enable DNSSEC validation |
-| `--opportunistic-tls-authoritative` | Opportunistic TLS to authoritative servers |
-| `--qname-minimisation` | Enable QNAME minimisation |
-| `-a`, `--authenticator` | X.509 authenticator for TLS validation |
-| `-l REGEXP` | Filter logs by regular expression |
-| `-v`, `-vv`, `-vvv` | Verbosity level |
+| Option                              | Description                                   |
+|-------------------------------------|-----------------------------------------------|
+| `--ipv4=CIDR`                       | IPv4 address and netmask (e.g. `10.0.0.2/24`) |
+| `--ipv4-gateway=ADDR`               | IPv4 gateway                                  |
+| `--ipv6`                            | Enable IPv6 support                           |
+| `--dnssec`                          | Enable DNSSEC validation                      |
+| `--opportunistic-tls-authoritative` | Opportunistic TLS to authoritative servers    |
+| `--qname-minimisation`              | Enable QNAME minimisation                     |
+| `-a`, `--authenticator`             | X.509 authenticator for TLS validation        |
+| `-l REGEXP`                         | Filter logs by regular expression             |
+| `-v`, `-vv`, `-vvv`                 | Verbosity level                               |
 
 ## License
 
-MIT — [Robur](https://robur.coop/)
+MIT - [Robur](https://robur.coop/)
 
 [solo5]: https://github.com/solo5/solo5
