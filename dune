@@ -1,9 +1,17 @@
+(library
+ (name ca)
+ (modules CA)
+ (wrapped false)
+ (libraries tls mirage-ptime dns dns-server x509 mirage-crypto-ec))
+
 (executable
  (name pagejaune)
  (public_name pagejaune)
+ (package annuaire)
  (modules pagejaune resolver)
  (link_flags :standard -cclib "-z solo5-abi=hvt")
  (libraries
+  ca
   hxd.core
   hxd.string
   ca-certs-nss
@@ -52,27 +60,36 @@
  (action
   (with-stdout-to
    manifest.pagejaune.json
-   (run %{exe:pagejaune.exe} --ipv4=0.0.0.0/24))))
+   (run %{exe:pagejaune.exe} --ipv4=0.0.0.0/24 --domain pagejaune.local))))
 
 (executable
  (name pageblanche)
  (public_name pageblanche)
- (modules pageblanche stub)
+ (package annuaire)
+ (modules pageblanche stub ban pin)
  (link_flags :standard -cclib "-z solo5-abi=hvt")
  (libraries
+  ca
   mnet
   mnet-cli
   mnet-dns
+  mnet-tls
   dns-server
   dns-resolver.shared
   dns-tsig
+  dns-certify
   logs.cli
   fmt.cli
   logs.fmt
   re
   gmp
   mirage-crypto-rng-mkernel
-  mnet-happy-eyeballs)
+  mirage-ptime.solo5
+  mnet-happy-eyeballs
+  mfat.bos
+  ohex
+  x509
+  tls)
  (foreign_stubs
   (language c)
   (names manifest.pageblanche)))
@@ -103,6 +120,6 @@
  (action
   (with-stdout-to
    manifest.pageblanche.json
-   (run %{exe:pageblanche.exe} --ipv4=0.0.0.0/24))))
+   (run %{exe:pageblanche.exe} --ipv4=0.0.0.0/24 --domain pageblanche.local))))
 
 (vendored_dirs vendors)

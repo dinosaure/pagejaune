@@ -18,19 +18,36 @@ pagejaune.hvt: pagejaune.hvt.target
 	@echo " STRIP pagejaune.hvt"
 	@strip $@
 
-pagejaune.install: pagejaune.hvt
-	@echo " GEN pagejaune.install"
+pageblanche.hvt.target: | vendors
+	@echo " BUILD pageblanche.exe"
+	@dune build --root . --profile=release ./pageblanche.exe
+	@echo " DESCR pageblanche.exe"
+	@$(shell dune describe location \
+		--context solo5 --no-print-directory --root . --display=quiet \
+		./pageblanche.exe 1> $@ 2>&1)
+
+pageblanche.hvt: pageblanche.hvt.target
+	@echo " COPY pageblanche.hvt"
+	@cp $(file < pageblanche.hvt.target) $@
+	@chmod +w $@
+	@echo " STRIP pageblanche.hvt"
+	@strip $@
+
+annuaire.install: pagejaune.hvt pageblanche.hvt
+	@echo " GEN annuaire.install"
 	@ocaml install.ml > $@
 
-all: pagejaune.install | vendors
+all: annuaire.install | vendors
 
 .PHONY: clean
 clean:
 	if [ -d vendors ] ; then rm -fr vendors ; fi
 	rm -f pagejaune.hvt.target
 	rm -f pagejaune.hvt
-	rm -f pagejaune.install
+	rm -f pageblanche.hvt.target
+	rm -f pageblanche.hvt
+	rm -f annuaire.install
 
-install: pagejaune.intall
-	@echo " INSTALL pagejaune"
-	opam-installer pagejaune.install
+install: annuaire.install
+	@echo " INSTALL annuaire"
+	opam-installer annuaire.install

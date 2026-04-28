@@ -2,12 +2,14 @@ module RNG = Mirage_crypto_rng.Fortuna
 
 let _2s = 2_000_000_000
 let ( let@ ) finally fn = Fun.protect ~finally fn
-let rec forever () = Mkernel.sleep _2s; forever ()
+let rec forever () = Mkernel.sleep _2s; Gc.compact (); forever ()
 let rng () = Mirage_crypto_rng_mkernel.initialize (module RNG)
 let rng = Mkernel.map rng Mkernel.[]
 let ( let* ) = Result.bind
+let guard ~err fn = if fn () then Ok () else Error err
+let msgf fmt = Fmt.kstr (fun msg -> `Msg msg) fmt
 
-let run _ (cidr, gateway, ipv6) features authenticator =
+let run _ (cidr, gateway, ipv6) features authenticator domain =
   Mkernel.(run [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidr ])
   @@ fun rng (daemon, tcp, udp) () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
@@ -15,9 +17,13 @@ let run _ (cidr, gateway, ipv6) features authenticator =
   let rng = Mirage_crypto_rng.generate in
   let root = Dns_resolver_shared.Root.reserved in
   let primary = Dns_server.Primary.create ~rng root in
-  let tls = Tls.Config.client ~authenticator () in
-  let tls = Result.get_ok tls in
-  let _resolver, daemon = Resolver.create ~features tls tcp udp primary in
+  let tls =
+    let ipaddr = Ipaddr.V4.Prefix.address cidr in
+    CA.cfg ipaddr domain
+  in
+  let cfg = Tls.Config.client ~authenticator () in
+  let cfg = Result.get_ok cfg in
+  let _resolver, daemon = Resolver.create ~features ~tls cfg tcp udp primary in
   let@ () = fun () -> Resolver.kill daemon in
   forever ()
 
@@ -134,19 +140,87 @@ let authenticator =
   & opt (some authenticator) None
   & info [ "a"; "authenticator" ] ~doc ~docv:"AUTHENTICATOR"
 
-let setup_authenticator = function
+(* Lenient opportunistic authenticator.
+
+   Authoritative DNS servers seldom present certificates issued by public
+   PKI; strict validation against the NSS bundle would force a downgrade to
+   plaintext on virtually every connection, defeating opportunistic privacy
+   (see RFC 9539, "Unilateral Opportunistic Use of DoT for Recursive-to-
+   Authoritative DNS"). On the other hand, blind acceptance discards useful
+   information. This wrapper tries strict PKI validation, accepts the chain
+   either way, and logs the outcome so anomalies (sudden issuer change,
+   newly invalid chain) are observable. *)
+let lenient_authenticator strict =
+  let src = Logs.Src.create "pagejaune.authenticator" in
+  let module Log = (val Logs.src_log src : Logs.LOG) in
+  let pp_chain ppf certs =
+    let pp_subject ppf cert =
+      let subject = X509.Certificate.subject cert in
+      X509.Distinguished_name.pp ppf subject
+    in
+    Fmt.list ~sep:Fmt.sp pp_subject ppf certs
+  in
+  fun ?ip ~host certs ->
+    match strict ?ip ~host certs with
+    | Ok _ as value ->
+        Log.info (fun m ->
+            m "Authoritative cert validated against PKI: %a" pp_chain certs);
+        value
+    | Error err ->
+        Log.warn (fun m ->
+            m "Authoritative cert NOT validated (%a); accepting anyway: %a"
+              X509.Validation.pp_validation_error err pp_chain certs);
+        Ok None
+
+let setup_authenticator features = function
+  | Some (fn, _) -> fn (Fun.compose Option.some Mirage_ptime.now)
   | None ->
-      let authenticator = Ca_certs_nss.authenticator () in
-      Result.get_ok authenticator
-  | Some (fn, _) -> fn (Fun.compose Option.some Resolver.wall)
+      let opportunistic = List.mem `Opportunistic_tls_authoritative features in
+      let nss = Result.get_ok (Ca_certs_nss.authenticator ()) in
+      if opportunistic then lenient_authenticator nss else nss
 
 let setup_authenticator =
   let open Term in
-  const setup_authenticator $ authenticator
+  const setup_authenticator $ features $ authenticator
+
+let domain =
+  let local = Domain_name.of_string_exn "local" in
+  let is_valid subdomain =
+    Domain_name.is_subdomain ~subdomain ~domain:local
+    && Domain_name.count_labels subdomain >= 2
+  in
+  let parser str =
+    let* domain_name = Domain_name.of_string str in
+    let* domain_name = Domain_name.host domain_name in
+    let* () =
+      let err =
+        msgf "Invalid domain %a: must end with .local (e.g. foo.local)"
+          Domain_name.pp domain_name
+      in
+      guard ~err @@ fun () -> is_valid domain_name
+    in
+    Ok domain_name
+  in
+  let pp = Domain_name.pp in
+  Arg.conv (parser, pp)
+
+let domain =
+  let doc =
+    "Domain name advertised by the unikernel for DNS-over-TLS (e.g. \
+     pageblanche.local). The certificate's SAN, the A record and the TLSA \
+     record at _853._tcp.<domain> all use this name."
+  in
+  let open Arg in
+  required & opt (some domain) None & info [ "domain" ] ~doc ~docv:"DOMAIN"
 
 let term =
   let open Term in
-  const run $ setup_logs $ Mnet_cli.setup $ features $ setup_authenticator
+  const run
+  $ setup_logs
+  $ Mnet_cli.setup
+  $ features
+  $ setup_authenticator
+  $ domain
 
 let cmd =
   let info = Cmd.info "pagejaune" in

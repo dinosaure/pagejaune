@@ -80,7 +80,7 @@
    servers and re-dispatches the responses to active connections with our
    clients who asked us the questions or directly via a simple UDP packet. *)
 
-let src = Logs.Src.create "resolver"
+let src = Logs.Src.create "pagejaune.resolver"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
@@ -160,16 +160,6 @@ type t = {
   ; orphans: unit Miou.orphans
 }
 
-let nsec_per_day = 86_400 * 1_000_000_000
-and ps_per_ns = 1_000L
-
-let now () =
-  let nsec = Mkernel.clock_wall () in
-  let days = nsec / nsec_per_day in
-  let rem_ns = nsec mod nsec_per_day in
-  let rem_ps = Int64.mul (Int64.of_int rem_ns) ps_per_ns in
-  Ptime.v (days, rem_ps)
-
 exception Timeout
 
 let with_timeout ~timeout fn =
@@ -244,7 +234,7 @@ let incoming_connection : type flow.
         let data = Bytes.unsafe_to_string buf in
         let conn = `Tcp in
         let mono = Int64.of_int (Mkernel.clock_monotonic ()) in
-        let wall = now () in
+        let wall = Mirage_ptime.now () in
         let query = true in
         let pkt = { conn; dst; port; data; mono; wall; query } in
         Queue.push pkt t.queue;
@@ -288,12 +278,16 @@ let new_connection : type flow.
     Miou.Ownership.own o0;
     Log.debug (fun m -> m "new connection to %a:%d" Ipaddr.pp dst port);
     let flow =
-      try Flow.connect t (dst, port)
-      with exn ->
-        Log.err (fun m ->
-            m "Got an error while connecting to %a:%d: %s" Ipaddr.pp dst port
-              (Printexc.to_string exn));
-        raise exn
+      try Flow.connect t (dst, port) with
+      | Timeout as exn ->
+          Log.debug (fun m ->
+              m "Connection timeout to %a:%d" Ipaddr.pp dst port);
+          raise exn
+      | exn ->
+          Log.err (fun m ->
+              m "Got an error while connecting to %a:%d: %s" Ipaddr.pp dst port
+                (Printexc.to_string exn));
+          raise exn
     in
     Log.debug (fun m -> m "connected to %a:%d" Ipaddr.pp dst port);
     let finally1 flow = try Flow.close flow with _ -> () in
@@ -311,7 +305,7 @@ let new_connection : type flow.
         Log.debug (fun m -> m "<- @[<hov>%a@]" (Hxd_string.pp Hxd.default) data);
         let conn = `Tcp in
         let mono = Int64.of_int (Mkernel.clock_monotonic ()) in
-        let wall = now () in
+        let wall = Mirage_ptime.now () in
         let query = false in
         let pkt = { conn; dst; port; data; mono; wall; query } in
         Queue.push pkt t.queue;
@@ -368,12 +362,27 @@ let handle_query3 t (_protocol, dst, data) =
   Log.debug (fun m -> m "query *:%d -> %a:%d" src_port Ipaddr.pp dst 53);
   let* () = Mnet.UDP.sendto t.udp ~dst ~src_port ~port:53 data in
   let buf = Bytes.create 1500 in
+  (* NOTE(dinosaure): Loop until we receive a packet from the IP we actually
+     queried, or hit the timeout. Anything from a different peer is silently
+     dropped: an attacker who guesses [src_port] could otherwise inject
+     responses (or cache poisoning attempts) on the queue, where
+     [Dns_resolver.handle_buf] would still have to cycles validating them. *)
   let fn () = Mnet.UDP.recvfrom t.udp ~port:src_port buf in
-  let* len, _ = with_timeout ~timeout:_2s fn in
+  let rec go () =
+    let* len, (peer, _) = with_timeout ~timeout:_2s fn in
+    if not (Ipaddr.compare peer dst = 0) then begin
+      Log.warn (fun m ->
+          m "dropping spoofed/unexpected UDP from %a (expected %a)" Ipaddr.pp
+            peer Ipaddr.pp dst);
+      go ()
+    end
+    else Ok len
+  in
+  let* len = go () in
   let data = Bytes.sub_string buf 0 len in
   let conn = `Udp in
   let mono = Int64.of_int (Mkernel.clock_monotonic ()) in
-  let wall = now () in
+  let wall = Mirage_ptime.now () in
   let query = false in
   Log.debug (fun m ->
       m "new answer from *:%d -> %a:%d (mono: %Ldns, wall: %a)" src_port
@@ -477,7 +486,7 @@ let rec on_udp t =
   let conn = `Udp in
   let port = pport in
   let mono = Int64.of_int (Mkernel.clock_monotonic ()) in
-  let wall = now () in
+  let wall = Mirage_ptime.now () in
   let query = true in
   let pkt = { conn; dst= peer; port; data; mono; wall; query } in
   let () =
@@ -490,8 +499,8 @@ let rec on_udp t =
 let rec clean_up orphans =
   match Miou.care orphans with
   | Some None | None -> ()
-  | Some (Some prm) -> begin
-      match Miou.await prm with
+  | Some (Some prm) ->
+      begin match Miou.await prm with
       | Ok () -> clean_up orphans
       | Error Timeout -> clean_up orphans
       | Error exn ->
@@ -499,7 +508,7 @@ let rec clean_up orphans =
               m "Unexpected exception from a promise: %s"
                 (Printexc.to_string exn));
           clean_up orphans
-    end
+      end
 
 let on_tcp t =
   let rec go orphans listen =
@@ -508,28 +517,35 @@ let on_tcp t =
     let _, (dst, port) = Mnet.TCP.peers flow in
     Log.debug (fun m ->
         m "new TCP/DNS connection from %a:%d" Ipaddr.pp dst port);
-    let _ =
-      Miou.async ~orphans @@ fun () ->
-      let qout = Qout.create () in
-      Hashtbl.replace t.ins (dst, port) qout;
-      incoming_tcp_connection t qout flow
-    in
+    let qout = Qout.create () in
+    Hashtbl.replace t.ins (dst, port) qout;
+    let fn () = incoming_tcp_connection t qout flow in
+    let _ = Miou.async ~orphans fn in
     go orphans listen
   in
   go (Miou.orphans ()) (Mnet.TCP.listen t.tcp 53)
 
-let on_tls t cfg =
+let on_tls t state =
   let rec go orphans listen =
     let flow = Mnet.TCP.accept t.tcp listen in
     let _ =
       Miou.async ~orphans @@ fun () ->
+      let res = Miou.Ownership.create ~finally:Mnet.TCP.close flow in
+      Miou.Ownership.own res;
       let qout = Qout.create () in
       let _, (dst, port) = Mnet.TCP.peers flow in
       Hashtbl.replace t.ins (dst, port) qout;
+      let cfg = Atomic.get state in
       let fn () = Mnet_tls.server_of_fd cfg flow in
-      match with_timeout ~timeout:_2s fn with
+      begin match with_timeout ~timeout:_2s fn with
       | Ok flow -> incoming_tls_connection t qout flow
-      | Error _ -> Hashtbl.remove t.ins (dst, port)
+      | Error _ | (exception _) ->
+          Log.debug (fun m ->
+              m "impossible to initiate a TLS connection to %a:%d" Ipaddr.pp dst
+                port);
+          Hashtbl.remove t.ins (dst, port)
+      end;
+      Miou.Ownership.release res
     in
     go orphans listen
   in
@@ -583,8 +599,9 @@ let rec tick timeout t =
 
 type daemon = {
     tcp_server: unit Miou.t
-  ; tls_server: unit Miou.t option
   ; udp_server: unit Miou.t
+  ; tls_server: unit Miou.t option
+  ; crt_update: unit Miou.t option
   ; ticker: unit Miou.t
 }
 
@@ -594,28 +611,95 @@ let kill daemon =
   Option.iter Miou.cancel daemon.tls_server;
   Miou.cancel daemon.ticker
 
-let nsec_per_day = Int64.mul 86_400L 1_000_000_000L
-let ps_per_ns = 1_000L
-
-let now_d_ps () =
-  let nsec = Mkernel.clock_wall () in
-  let nsec = Int64.of_int nsec in
-  let days = Int64.div nsec nsec_per_day in
-  let rem_ns = Int64.rem nsec nsec_per_day in
-  let rem_ps = Int64.mul rem_ns ps_per_ns in
-  (Int64.to_int days, rem_ps)
-
-let wall () = Ptime.v (now_d_ps ())
 let monotonic () = Int64.of_int (Mkernel.clock_monotonic ())
 
-let create ?(features = []) ?tls cfg tcp udp primary =
-  let rng len = Mirage_crypto_rng.generate len in
-  let ip_protocol = `Ipv4_only in
-  let state =
-    Dns_resolver.create ~ip_protocol features (wall ()) (monotonic ()) rng
-      primary
+let span_to_ns span =
+  let d, ps = Ptime.Span.to_d_ps span in
+  let ns_per_d = 86_400 * 1_000_000_000 in
+  (d * ns_per_d) + Int64.to_int (Int64.div ps 1_000L)
+
+let renewal_delay tls ~valid_until =
+  let now = Mirage_ptime.now () in
+  let target =
+    match Ptime.sub_span valid_until tls.CA.renew_before with
+    | Some t -> t
+    | None -> valid_until
   in
+  let span = Ptime.diff target now in
+  if Ptime.Span.compare span Ptime.Span.zero <= 0 then 0 else span_to_ns span
+
+let publish_tlsa t tls tlsa =
+  Miou.Mutex.protect t.mutex @@ fun () ->
+  let state = t.state in
+  let trie = Dns_resolver.primary_data state in
+  let trie = CA.with_tlsa tls tlsa trie in
+  let now = Mirage_ptime.now () in
+  let mon = Int64.of_int (Mkernel.clock_monotonic ()) in
+  let state, _ = Dns_resolver.with_primary_data state now mon trie in
+  t.state <- state
+
+let renew t state tls initial_tlsa initial_valid_until =
+  let current_tlsa = ref initial_tlsa in
+  let valid_until = ref initial_valid_until in
+  let ttl_ns =
+    Int64.to_int (Int64.mul (Int64.of_int32 tls.CA.ttl) 1_000_000_000L)
+  in
+  let rec go () =
+    let delay = renewal_delay tls ~valid_until:!valid_until in
+    if delay > 0 then Mkernel.sleep delay;
+    Log.info (fun m ->
+        m "renewing TLS certificate for %a" Domain_name.pp tls.domain);
+    match CA.generate tls with
+    | Error (`Msg msg) ->
+        Log.err (fun m -> m "Renewal failed (%s); retrying in 1h" msg);
+        Mkernel.sleep (3_600 * 1_000_000_000);
+        go ()
+    | Ok (server, tlsa', valid_until') ->
+        publish_tlsa t tls [ !current_tlsa; tlsa' ];
+        Log.debug (fun m ->
+            m "published overlap TLSA set, waiting %lds for caches" tls.ttl);
+        if ttl_ns > 0 then Mkernel.sleep ttl_ns;
+        Atomic.set state server;
+        publish_tlsa t tls [ tlsa' ];
+        current_tlsa := tlsa';
+        valid_until := valid_until';
+        Log.info (fun m ->
+            m "TLS certificate renewed (valid until %a)" (Ptime.pp_human ())
+              valid_until');
+        go ()
+  in
+  go ()
+
+let create ?(features = []) ?(ip_protocol = `Ipv4_only) ?tls cfg tcp udp primary
+    =
+  let rng len = Mirage_crypto_rng.generate len in
   let opportunistic = List.mem `Opportunistic_tls_authoritative features in
+  let tls =
+    match tls with
+    | None -> None
+    | Some tls ->
+        begin match CA.generate tls with
+        | Error (`Msg msg) ->
+            Log.err (fun m -> m "Cannot generate initial certificate: %s" msg);
+            None
+        | Ok (server, tlsa, valid_until) ->
+            Log.debug (fun m -> m "Prepare a DNS-over-TLS server");
+            let trie = Dns_server.Primary.data primary in
+            let trie = CA.zone tls ~tlsa trie in
+            Log.debug (fun m -> m "@[<hov>%a@]" Dns_trie.pp trie);
+            let now = Mirage_ptime.now () in
+            let mon = Int64.of_int (Mkernel.clock_monotonic ()) in
+            let primary, _ =
+              Dns_server.Primary.with_data primary now mon trie
+            in
+            Some (primary, server, tls, tlsa, valid_until)
+        end
+  in
+  let primary = match tls with Some (p, _, _, _, _) -> p | None -> primary in
+  let state =
+    Dns_resolver.create ~ip_protocol features (Mirage_ptime.now ())
+      (monotonic ()) rng primary
+  in
   let t =
     {
       state
@@ -634,8 +718,17 @@ let create ?(features = []) ?tls cfg tcp udp primary =
     }
   in
   let tcp_server = Miou.async @@ fun () -> on_tcp t in
-  let fn cfg = Miou.async @@ fun () -> on_tls t cfg in
-  let tls_server = Option.map fn tls in
   let udp_server = Miou.async @@ fun () -> on_udp t in
+  let tls_server, crt_update =
+    match tls with
+    | None -> (None, None)
+    | Some (_, server, tls, tlsa, valid_until) ->
+        let current = Atomic.make server in
+        let listener = Miou.async @@ fun () -> on_tls t current in
+        let renewer =
+          Miou.async @@ fun () -> renew t current tls tlsa valid_until
+        in
+        (Some listener, Some renewer)
+  in
   let ticker = Miou.async @@ fun () -> tick _2s t in
-  (t, { tcp_server; tls_server; udp_server; ticker })
+  (t, { tcp_server; udp_server; tls_server; crt_update; ticker })
