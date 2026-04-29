@@ -2,13 +2,11 @@ type cfg = {
     domain: [ `host ] Domain_name.t
   ; ipaddr: Ipaddr.V4.t
   ; lifetime: Ptime.Span.t
-  ; renew_before: Ptime.Span.t
   ; ttl: int32
 }
 
 val cfg :
      ?lifetime:Ptime.span
-  -> ?renew_before:Ptime.span
   -> ?ttl:int32
   -> Ipaddr.V4.t
   -> [ `host ] Domain_name.t

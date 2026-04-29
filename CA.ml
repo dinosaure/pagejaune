@@ -61,13 +61,11 @@ type cfg = {
     domain: [ `host ] Domain_name.t
   ; ipaddr: Ipaddr.V4.t
   ; lifetime: Ptime.Span.t
-  ; renew_before: Ptime.Span.t
   ; ttl: int32
 }
 
-let cfg ?(lifetime = _365d) ?(renew_before = _30d) ?(ttl = 3600l) ipaddr domain
-    =
-  { domain; ipaddr; lifetime; renew_before; ttl }
+let cfg ?(lifetime = _365d) ?(ttl = 3600l) ipaddr domain =
+  { domain; ipaddr; lifetime; ttl }
 
 let make_tls_config cert pk =
   let chain = ([ cert ], pk) in

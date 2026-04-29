@@ -86,17 +86,53 @@ let refresh client pin tlsa_name =
           else if Int32.compare half _1d > 0 then _1d
           else half
         in
+        Logs.debug (fun m ->
+            m "wait %a to ask the next TLSA" Duration.pp
+              (Duration.of_sec (Int32.to_int next_secs)));
         Mkernel.sleep (Int32.to_int next_secs * 1_000_000_000);
         go ()
   in
   go ()
 
+let tlsa_of_spki_hash data =
+  {
+    Dns.Tlsa.cert_usage= Dns.Tlsa.Domain_issued_certificate
+  ; selector= Dns.Tlsa.Subject_public_key_info
+  ; matching_type= Dns.Tlsa.SHA256
+  ; data
+  }
+
+let ask_tlsa_to_pagejaune udp he ipaddr port peer_name =
+  let nameservers = (`Tcp, [ `Plaintext (ipaddr, port) ]) in
+  let dns0 = Mnet_dns.create ~nameservers (udp, he) in
+  let raw = Domain_name.raw peer_name in
+  let n = Domain_name.prepend_label_exn raw "_tcp" in
+  let tlsa_name = Domain_name.prepend_label_exn n (Fmt.str "_%d" port) in
+  let* _ttl, set =
+    Mnet_dns.get_resource_record dns0 Dns.Rr_map.Tlsa tlsa_name
+  in
+  let pin = Pin.v set in
+  let pagejaune =
+    let authenticator = Pin.authenticator pin in
+    let cfg = Tls.Config.client ~authenticator ~peer_name () in
+    let cfg = Result.get_ok cfg in
+    `Tls (cfg, ipaddr, port)
+  in
+  let nameservers = (`Tcp, [ pagejaune ]) in
+  Ok (nameservers, pin, tlsa_name)
+
+let process_pagejaune udp he = function
+  | `Ready (nameservers, pin, tlsa_name) -> Some (nameservers, pin, tlsa_name)
+  | `Ask (ipaddr, port, peer_name) ->
+      let result = ask_tlsa_to_pagejaune udp he ipaddr port peer_name in
+      Result.to_option result
+
 let devices ?gateway ~ipv6 cidr =
   let open Mkernel in
   [ rng; Mnet.stack ~name:"service" ?gateway ~ipv6 cidr; fat32 ~name:"lst" ]
 
-let run _ (cidr, gateway, ipv6) (nameservers, pin, tlsa_name) happy_eyeballs
-    domain lifetime renew_before =
+let run _ (cidr, gateway, ipv6) pagejaune nameservers happy_eyeballs domain
+    lifetime =
   Mkernel.run (devices ?gateway ~ipv6 cidr)
   @@ fun rng (daemon, tcp, udp) fs () ->
   let@ () = fun () -> Mirage_crypto_rng_mkernel.kill rng in
@@ -104,26 +140,31 @@ let run _ (cidr, gateway, ipv6) (nameservers, pin, tlsa_name) happy_eyeballs
   let hed, he = Mnet_happy_eyeballs.create ~happy_eyeballs tcp in
   let@ () = fun () -> Mnet_happy_eyeballs.kill hed in
   let ban = banlist fs in
-  (* 1m for timeout *)
-  let cfg = Stub.config ~nameservers 53 in
-  let dns =
-    Mnet_dns.create ?cache_size:cfg.cache_size ?edns:cfg.edns ~nameservers
-      ?timeout:cfg.timeout (udp, he)
-  in
+  let cfg = Stub.config 53 in
   let tls =
     let ipaddr = Ipaddr.V4.Prefix.address cidr in
-    CA.cfg ~lifetime ~renew_before ipaddr domain
+    let lifetime = Ptime.Span.of_int_s (Duration.to_sec lifetime) in
+    CA.cfg ~lifetime ipaddr domain
   in
-  let _stub, daemon = Stub.create cfg ~ban ~tls tcp udp dns in
-  let@ () = fun () -> Stub.kill daemon in
-  let refresher =
-    match (pin, tlsa_name) with
-    | Some pin, Some tlsa_name ->
+  let pagejaune = Option.bind pagejaune (process_pagejaune udp he) in
+  let clients, refresher =
+    match pagejaune with
+    | Some (nameservers, pin, tlsa_name) ->
+        let dns =
+          let cache_size = cfg.Stub.cache_size
+          and edns = cfg.Stub.edns
+          and timeout = cfg.Stub.timeout in
+          Mnet_dns.create ?cache_size ?edns ?timeout ~nameservers (udp, he)
+        in
         let prm = Miou.async @@ fun () -> refresh dns pin tlsa_name in
-        Some prm
-    | _ -> None
+        (Some [ dns ], Some prm)
+    | _ -> (None, None)
   in
   let@ () = fun () -> Option.iter Miou.cancel refresher in
+  let _stub, daemon =
+    Stub.create cfg ~ban ~tls ?clients tcp udp he nameservers
+  in
+  let@ () = fun () -> Stub.kill daemon in
   forever ()
 
 open Cmdliner
@@ -243,47 +284,23 @@ let domain =
 let domain =
   let doc =
     "Domain name advertised by the unikernel for DNS-over-TLS (e.g. \
-     pageblanche.local). The certificate's SAN, the A record and the TLSA \
-     record at _853._tcp.<domain> all use this name."
+     foo.local). The certificate's SAN, the A record and the TLSA record at \
+     _853._tcp.<domain> all use this name."
   in
   let open Arg in
   required & opt (some domain) None & info [ "domain" ] ~doc ~docv:"DOMAIN"
 
-let span_days =
-  let parser str =
-    match int_of_string_opt str with
-    | Some n when n > 0 -> Ok (Ptime.Span.v (n, 0L))
-    | _ -> error_msgf "Invalid number of days: %S" str
-  in
-  let pp ppf span =
-    let d, _ = Ptime.Span.to_d_ps span in
-    Fmt.pf ppf "%dd" d
-  in
+let duration =
+  let parser = Duration.of_string in
+  let pp = Duration.pp in
   Arg.conv (parser, pp)
 
 let lifetime =
-  let doc = "Validity period (in days) of the self-signed TLS certificate." in
+  let doc = "Validity period of the self-signed TLS certificate." in
   let open Arg in
   value
-  & opt span_days (Ptime.Span.v (365, 0L))
-  & info [ "tls-lifetime" ] ~doc ~docv:"DAYS"
-
-let renew_before =
-  let doc =
-    "Number of days before expiration at which the certificate is renewed."
-  in
-  let open Arg in
-  value
-  & opt span_days (Ptime.Span.v (30, 0L))
-  & info [ "tls-renew-before" ] ~doc ~docv:"DAYS"
-
-let tlsa_of_spki_hash data =
-  {
-    Dns.Tlsa.cert_usage= Dns.Tlsa.Domain_issued_certificate
-  ; selector= Dns.Tlsa.Subject_public_key_info
-  ; matching_type= Dns.Tlsa.SHA256
-  ; data
-  }
+  & opt duration (Duration.of_day 365)
+  & info [ "tls-lifetime" ] ~doc ~docv:"DURATION"
 
 let pagejaune =
   let parse_pin str =
@@ -294,37 +311,43 @@ let pagejaune =
   in
   let parser str =
     match String.split_on_char '!' str with
+    | [ endpoint; host ] ->
+        let* ipaddr, port = Ipaddr.with_port_of_string ~default:853 endpoint in
+        let* dn = Domain_name.of_string host in
+        let* dn = Domain_name.host dn in
+        Ok (ipaddr, port, dn, None)
     | [ endpoint; host; pin ] ->
         let* ipaddr, port = Ipaddr.with_port_of_string ~default:853 endpoint in
         let* dn = Domain_name.of_string host in
         let* dn = Domain_name.host dn in
         let* tlsa = parse_pin pin in
-        Ok (ipaddr, port, dn, tlsa)
+        Ok (ipaddr, port, dn, Some tlsa)
     | _ ->
         error_msgf "Expected <ip>[:<port>]!<host>!<spki-sha256-hex>, got %S" str
   in
-  let pp ppf (ipaddr, port, host, tlsa) =
-    Fmt.pf ppf "%a:%d!%a!%s" Ipaddr.pp ipaddr port Domain_name.pp host
-      (Ohex.encode tlsa.Dns.Tlsa.data)
+  let pp ppf = function
+    | ipaddr, port, host, Some tlsa ->
+        Fmt.pf ppf "%a:%d!%a!%s" Ipaddr.pp ipaddr port Domain_name.pp host
+          (Ohex.encode tlsa.Dns.Tlsa.data)
+    | ipaddr, port, host, None ->
+        Fmt.pf ppf "%a:%d!%a" Ipaddr.pp ipaddr port Domain_name.pp host
   in
   Arg.conv (parser, pp)
 
 let pagejaune =
   let doc =
     "Upstream pagejaune endpoint as <ip>[:<port>]!<host>!<spki-sha256-hex>. \
-     When set, $(cmd) forwards every recursive query over DoT to this endpoint \
-     and ignores --nameserver. The leaf certificate of pagejaune is \
-     authenticated against the DANE-EE 3 1 1 pin given here, which is then \
-     refreshed periodically by querying _853._tcp.<host> TLSA over the \
-     established channel."
+     When set, $(cmd) forwards every recursive query over DoT to this \
+     endpoint. The leaf certificate of pagejaune is authenticated against the \
+     DANE-EE 3 1 1 pin given here, which is then refreshed periodically by \
+     querying _853._tcp.<host> TLSA over the established channel."
   in
   let open Arg in
   value & opt (some pagejaune) None & info [ "pagejaune" ] ~doc ~docv:"ENDPOINT"
 
-let setup_nameservers pagejaune nameservers =
-  match (pagejaune, nameservers) with
-  | None, _ -> (nameservers, None, None)
-  | Some (ipaddr, port, peer_name, initial_pin), (`Tcp, nameservers) ->
+let setup_pagejaune = function
+  | None -> None
+  | Some (ipaddr, port, peer_name, Some initial_pin) ->
       let pin = Pin.v (Dns.Rr_map.Tlsa_set.singleton initial_pin) in
       let pagejaune =
         let authenticator = Pin.authenticator pin in
@@ -335,38 +358,24 @@ let setup_nameservers pagejaune nameservers =
       let raw = Domain_name.raw peer_name in
       let n = Domain_name.prepend_label_exn raw "_tcp" in
       let tlsa_name = Domain_name.prepend_label_exn n (Fmt.str "_%d" port) in
-      ((`Tcp, pagejaune :: nameservers), Some pin, Some tlsa_name)
-  | Some (ipaddr, port, peer_name, initial_pin), (`Udp, _) ->
-      Logs.warn (fun m ->
-          m
-            "We can not mix a pagejaune unikernel with UDP nameservers (and we \
-             discard them)");
-      let pin = Pin.v (Dns.Rr_map.Tlsa_set.singleton initial_pin) in
-      let pagejaune =
-        let authenticator = Pin.authenticator pin in
-        let cfg = Tls.Config.client ~authenticator ~peer_name () in
-        let cfg = Result.get_ok cfg in
-        `Tls (cfg, ipaddr, port)
-      in
-      let raw = Domain_name.raw peer_name in
-      let n = Domain_name.prepend_label_exn raw "_tcp" in
-      let tlsa_name = Domain_name.prepend_label_exn n (Fmt.str "_%d" port) in
-      ((`Tcp, [ pagejaune ]), Some pin, Some tlsa_name)
+      Some (`Ready ((`Tcp, [ pagejaune ]), pin, tlsa_name))
+  | Some (ipaddr, port, peer_name, None) ->
+      Some (`Ask (ipaddr, port, peer_name))
 
-let setup_nameservers =
+let setup_pagejaune =
   let open Term in
-  const setup_nameservers $ pagejaune $ Mnet_cli.setup_nameservers ()
+  const setup_pagejaune $ pagejaune
 
 let term =
   let open Term in
   const run
   $ setup_logs
   $ Mnet_cli.setup
-  $ setup_nameservers
+  $ setup_pagejaune
+  $ Mnet_cli.nameservers ()
   $ setup_happy_eyeballs
   $ domain
   $ lifetime
-  $ renew_before
   $ pagejaune
 
 let cmd =

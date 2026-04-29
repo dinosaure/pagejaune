@@ -618,13 +618,12 @@ let span_to_ns span =
   let ns_per_d = 86_400 * 1_000_000_000 in
   (d * ns_per_d) + Int64.to_int (Int64.div ps 1_000L)
 
-let renewal_delay tls ~valid_until =
+let _1h = Ptime.Span.of_int_s 3600
+
+let renewal_delay validity =
   let now = Mirage_ptime.now () in
-  let target =
-    match Ptime.sub_span valid_until tls.CA.renew_before with
-    | Some t -> t
-    | None -> valid_until
-  in
+  let target = Ptime.sub_span validity _1h in
+  let target = Option.value ~default:validity target in
   let span = Ptime.diff target now in
   if Ptime.Span.compare span Ptime.Span.zero <= 0 then 0 else span_to_ns span
 
@@ -645,7 +644,7 @@ let renew t state tls initial_tlsa initial_valid_until =
     Int64.to_int (Int64.mul (Int64.of_int32 tls.CA.ttl) 1_000_000_000L)
   in
   let rec go () =
-    let delay = renewal_delay tls ~valid_until:!valid_until in
+    let delay = renewal_delay !valid_until in
     if delay > 0 then Mkernel.sleep delay;
     Log.info (fun m ->
         m "renewing TLS certificate for %a" Domain_name.pp tls.domain);

@@ -17,6 +17,7 @@ depends: [
   "mnet-cli"
   "cmdliner"
   "re"
+  "mfat"
   "ca-certs-nss"
   "mirage-ptime"
   "mkernel"
@@ -29,4 +30,5 @@ build: [
 synopsis: "An unikernel which serve HTTP contents"
 pin-depends: [
   [ "zarith.dev" "git+https://github.com/mirage/Zarith.git#df8969d9bb95cffca13e31a615189ab27ada0684" ]
+  [ "mfat.dev" "git+https://github.com/robur-coop/mfat.git#5d6aa2dd6067133c76b0f8f8b8cca4faf4eb9104" ]
 ]

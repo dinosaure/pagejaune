@@ -10,14 +10,13 @@ type io_addr =
 type cfg = {
     cache_size: int option
   ; edns: [ `Auto | `Manual of Dns.Edns.t | `None ] option
-  ; nameservers: (Dns.proto * io_addr list) option
   ; timeout: int64 option
   ; port: int
   ; secure_port: int
 }
 
-let config ?cache_size ?edns ?nameservers ?timeout ?(secure_port = 853) port =
-  { cache_size; edns; nameservers; timeout; port; secure_port }
+let config ?cache_size ?edns ?timeout ?(secure_port = 853) port =
+  { cache_size; edns; timeout; port; secure_port }
 
 exception Timeout
 
@@ -44,7 +43,7 @@ let rec clean_up orphans =
 type t = {
     mutex: Miou.Mutex.t
   ; mutable server: Dns_server.t
-  ; client: Mnet_dns.t
+  ; clients: Mnet_dns.t list
   ; ban: Ban.t
 }
 
@@ -239,17 +238,72 @@ let server t proto ipaddr pkt hdr question data str =
       let pkt = reply hdr question proto data in
       Some (pkt, Dns.Rcode.NotImp)
 
+let _5ms = 500_000_000
+
+let race clients key name =
+  let cancel orphans =
+    let prms = Seq.of_dispenser (fun () -> Miou.take orphans) in
+    let prms = List.of_seq prms in
+    List.iter Miou.cancel prms
+  in
+  let rec clean_up orphans =
+    match Miou.care orphans with
+    | None | Some None -> None
+    | Some (Some prm) ->
+        begin match Miou.await prm with
+        | Error _exn -> clean_up orphans
+        | Ok (Error (`Msg _)) -> clean_up orphans
+        | Ok data -> Some data
+        end
+  in
+  let rec terminate orphans =
+    match Miou.care orphans with
+    | None -> None
+    | Some None ->
+        Log.debug (fun m -> m "Waiting for one of our nameserver");
+        Mkernel.sleep _5ms;
+        terminate orphans
+    | Some (Some prm) ->
+        begin match Miou.await prm with
+        | Error _exn -> terminate orphans
+        | Ok (Error (`Msg _)) -> terminate orphans
+        | Ok data -> cancel orphans; Some data
+        end
+  in
+  let rec go orphans clients =
+    match (clean_up orphans, clients) with
+    | None, [] -> terminate orphans
+    | None, client :: clients ->
+        let prm0 =
+          Miou.async ~orphans @@ fun () ->
+          Mnet_dns.get_resource_record client key name
+        in
+        let prm1 =
+          Miou.async ~orphans @@ fun () -> Mkernel.sleep _5ms; raise Timeout
+        in
+        begin match Miou.await_one [ prm0; prm1 ] with
+        | Error _exn ->
+            Log.debug (fun m -> m "Try with the next nameserver");
+            go orphans clients
+        | Ok (Error (`Msg _)) ->
+            Log.debug (fun m -> m "Try with the next nameserver");
+            go orphans clients
+        | Ok data -> cancel orphans; Some data
+        end
+    | Some data, _ -> cancel orphans; Some data
+  in
+  go (Miou.orphans ()) clients
+
 let resolve t question data hdr proto =
   let name = fst question in
   match (data, snd question) with
   | `Query, `K (Dns.Rr_map.K key) ->
-      begin match Mnet_dns.get_resource_record t.client key name with
-      | Error (`Msg msg) ->
-          Log.err (fun m -> m "Couldn't resolve %s" msg);
+      begin match race t.clients key name with
+      | None | Some (Error (`Msg _)) ->
           let data = `Rcode_error Dns.(Rcode.ServFail, Opcode.Query, None) in
           let reply = reply hdr question proto data in
           Some (reply, Dns.Rcode.ServFail)
-      | Error (`No_data (domain, soa)) ->
+      | Some (Error (`No_data (domain, soa))) ->
           let answer =
             let open Dns.Name_rr_map in
             (empty, singleton domain Soa soa)
@@ -257,7 +311,7 @@ let resolve t question data hdr proto =
           let data = `Answer answer in
           let reply = reply hdr question proto data in
           Some (reply, Dns.Rcode.NoError)
-      | Error (`No_domain (domain, soa)) ->
+      | Some (Error (`No_domain (domain, soa))) ->
           let answer =
             let open Dns.Name_rr_map in
             (empty, singleton domain Soa soa)
@@ -266,7 +320,7 @@ let resolve t question data hdr proto =
           let data = `Rcode_error (rcode, Dns.Opcode.Query, Some answer) in
           let reply = reply hdr question proto data in
           Some (reply, Dns.Rcode.NXDomain)
-      | Ok value ->
+      | Some (Ok value) ->
           let answer =
             let open Dns.Name_rr_map in
             (singleton name key value, empty)
@@ -310,10 +364,11 @@ let handler t proto ipaddr str =
         | `Query when Ban.is_blocked t.ban name ->
             Log.info (fun m -> m "Blocked %a" Domain_name.pp name);
             Some (blocked_reply hdr question proto, Dns.Rcode.NXDomain)
-        | _ -> (
-            match server t proto ipaddr pkt hdr question data str with
+        | _ ->
+            begin match server t proto ipaddr pkt hdr question data str with
             | Some _ as value -> value
-            | None -> resolve t question data hdr proto)
+            | None -> resolve t question data hdr proto
+            end
       in
       Option.map fst reply
 
@@ -322,13 +377,12 @@ let span_to_ns span =
   let ns_per_d = 86_400 * 1_000_000_000 in
   (d * ns_per_d) + Int64.to_int (Int64.div ps 1_000L)
 
-let renewal_delay tls ~valid_until =
+let _1h = Ptime.Span.of_int_s 3600
+
+let renewal_delay validity =
   let now = Mirage_ptime.now () in
-  let target =
-    match Ptime.sub_span valid_until tls.CA.renew_before with
-    | Some t -> t
-    | None -> valid_until
-  in
+  let target = Ptime.sub_span validity _1h in
+  let target = Option.value ~default:validity target in
   let span = Ptime.diff target now in
   if Ptime.Span.compare span Ptime.Span.zero <= 0 then 0 else span_to_ns span
 
@@ -345,7 +399,7 @@ let renew t state cfg tls initial_tlsa initial_valid_until =
     Int64.to_int (Int64.mul (Int64.of_int32 tls.CA.ttl) 1_000_000_000L)
   in
   let rec go () =
-    let delay = renewal_delay tls ~valid_until:!valid_until in
+    let delay = renewal_delay !valid_until in
     if delay > 0 then Mkernel.sleep delay;
     Log.info (fun m ->
         m "renewing TLS certificate for %a" Domain_name.pp tls.domain);
@@ -377,7 +431,8 @@ type daemon = {
   ; crt_update: unit Miou.t option
 }
 
-let create cfg ?(with_reserved = true) ?(ban = Ban.empty) ?tls tcp udp client =
+let create cfg ?(with_reserved = true) ?(ban = Ban.empty) ?(clients = []) ?tls
+    tcp udp he nameservers =
   let rng = Mirage_crypto_rng.generate in
   let primary = Dns_server.Primary.create ~rng Dns_trie.empty in
   let primary =
@@ -402,7 +457,6 @@ let create cfg ?(with_reserved = true) ?(ban = Ban.empty) ?tls tcp udp client =
             Log.debug (fun m -> m "Prepare a DNS-over-TLS server");
             let trie = Dns_server.Primary.data primary in
             let trie = CA.zone ~port:cfg.secure_port tls ~tlsa trie in
-            Log.debug (fun m -> m "@[<hov>%a@]" Dns_trie.pp trie);
             let now = Mirage_ptime.now () in
             let mon = Int64.of_int (Mkernel.clock_monotonic ()) in
             let primary, _ =
@@ -414,7 +468,19 @@ let create cfg ?(with_reserved = true) ?(ban = Ban.empty) ?tls tcp udp client =
   let primary = match tls with Some (p, _, _, _, _) -> p | None -> primary in
   let server = Dns_server.Primary.server primary in
   let mutex = Miou.Mutex.create () in
-  let t = { server; client; mutex; ban } in
+  let fn (proto, nameserver) =
+    let cache_size = cfg.cache_size
+    and edns = cfg.edns
+    and timeout = cfg.timeout in
+    Mnet_dns.create ?cache_size ?edns ?timeout
+      ~nameservers:(proto, [ nameserver ]) (udp, he)
+  in
+  let clients =
+    List.rev_append (List.rev_map fn nameservers) (List.rev clients)
+  in
+  let clients = List.rev clients in
+  Logs.info (fun m -> m "Use %d nameserver(s)" (List.length clients));
+  let t = { server; clients; mutex; ban } in
   if Ban.cardinal ban > 0 then
     Log.info (fun m -> m "Loaded %d ban entries" (Ban.cardinal ban));
   let tcp_server = Miou.async @@ fun () -> with_tcp t ~handler tcp cfg.port in
