@@ -9,4 +9,4 @@
  (package annuaire)
  (public_name annuaire.gen)
  (enabled_if (= %{context_name} "default"))
- (libraries cmdliner ohex annuaire.ca mirage-crypto-rng-miou-unix dns-client-miou-unix))
+ (libraries cmdliner ohex annuaire.ca mirage-crypto-rng.unix dns-client-miou-unix))
