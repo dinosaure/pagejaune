@@ -5,9 +5,8 @@ let ( let@ ) finally fn = Fun.protect ~finally fn
 let ( let* ) = Result.bind
 
 let run (ipaddr, port) domain seed =
+  Mirage_crypto_rng_unix.use_default ();
   Miou_unix.run ~domains:0 @@ fun () ->
-  let rng = Mirage_crypto_rng_miou_unix.(initialize (module Pfortuna)) in
-  let@ () = fun () -> Mirage_crypto_rng_miou_unix.kill rng in
   let hed, he = Happy_eyeballs_miou_unix.create () in
   let@ () = fun () -> Happy_eyeballs_miou_unix.kill hed in
   let nameservers = (`Udp, [ `Plaintext (ipaddr, port) ]) in
